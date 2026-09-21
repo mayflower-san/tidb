@@ -1042,12 +1042,22 @@ func (b *executorBuilder) buildInsert(v *physicalop.Insert) exec.Executor {
 	if selectExec != nil {
 		children = append(children, selectExec)
 	}
-	baseExec := exec.NewBaseExecutor(b.sctx, nil, v.ID(), children...)
-	baseExec.SetInitCap(chunk.ZeroCapacity)
+	// An INSERT only produces rows when it carries a RETURNING clause; in that case the
+	// plan's schema describes them and the executor keeps a normal initial chunk size.
+	var schema *expression.Schema
+	if len(v.Returning) > 0 {
+		schema = v.Schema()
+	}
+	baseExec := exec.NewBaseExecutor(b.sctx, schema, v.ID(), children...)
+	if schema == nil {
+		baseExec.SetInitCap(chunk.ZeroCapacity)
+	}
 
 	op := "INSERT"
+	sourceStmt := tables.MLogSourceInsert
 	if v.IsReplace {
 		op = "REPLACE"
+		sourceStmt = tables.MLogSourceReplace
 	}
 	// Planner already rejects DML on MV/mlog tables; this catches bypass bugs.
 	intest.AssertFunc(func() bool {
@@ -1055,10 +1065,14 @@ func (b *executorBuilder) buildInsert(v *physicalop.Insert) exec.Executor {
 		intest.AssertNoError(plannercore.CheckMViewUpdatable(sv, v.Table.Meta(), "", op))
 		return true
 	})
+	insertTable := b.wrapTableWithMLogIfExists(v.Table, sourceStmt)
+	if b.err != nil {
+		return nil
+	}
 
 	ivs := &InsertValues{
 		BaseExecutor:              baseExec,
-		Table:                     v.Table,
+		Table:                     insertTable,
 		Columns:                   v.Columns,
 		Lists:                     v.Lists,
 		GenExprs:                  v.GenCols.Exprs,
@@ -1086,8 +1100,10 @@ func (b *executorBuilder) buildInsert(v *physicalop.Insert) exec.Executor {
 		return b.buildReplace(ivs)
 	}
 	insert := &InsertExec{
-		InsertValues: ivs,
-		OnDuplicate:  append(v.OnDuplicate, v.GenCols.OnDuplicates...),
+		InsertValues:             ivs,
+		OnDuplicate:              append(v.OnDuplicate, v.GenCols.OnDuplicates...),
+		returningExprs:           v.Returning,
+		returningNeedExtraHandle: v.NeedExtraHandleReturning,
 	}
 	return insert
 }
@@ -1108,6 +1124,12 @@ func (b *executorBuilder) buildImportInto(v *plannercore.ImportInto) exec.Execut
 	})
 	if !tbl.Meta().IsBaseTable() {
 		b.err = plannererrors.ErrNonUpdatableTable.GenWithStackByArgs(tbl.Meta().Name.O, "IMPORT")
+		return nil
+	}
+	if meta := tbl.Meta(); meta.MaterializedViewBase != nil && meta.MaterializedViewBase.MLogID != 0 {
+		b.err = plannererrors.ErrNotSupportedYet.GenWithStackByArgs(
+			"IMPORT INTO on tables with materialized view log",
+		)
 		return nil
 	}
 
@@ -1146,6 +1168,10 @@ func (b *executorBuilder) buildLoadData(v *plannercore.LoadData) exec.Executor {
 	})
 	if !tbl.Meta().IsBaseTable() {
 		b.err = plannererrors.ErrNonUpdatableTable.GenWithStackByArgs(tbl.Meta().Name.O, "LOAD")
+		return nil
+	}
+	tbl = b.wrapTableWithMLogIfExists(tbl, tables.MLogSourceLoadData)
+	if b.err != nil {
 		return nil
 	}
 
@@ -3040,11 +3066,11 @@ func (b *executorBuilder) buildUpdate(v *physicalop.Update) exec.Executor {
 	tblID2table := make(map[int64]table.Table, len(v.TblColPosInfos))
 	multiUpdateOnSameTable := make(map[int64]bool)
 	for _, info := range v.TblColPosInfos {
-		tbl, _ := b.is.TableByID(context.Background(), info.TblID)
 		if _, ok := tblID2table[info.TblID]; ok {
 			multiUpdateOnSameTable[info.TblID] = true
+			continue
 		}
-		tblID2table[info.TblID] = tbl
+		tbl, _ := b.is.TableByID(context.Background(), info.TblID)
 		if len(v.PartitionedTable) > 0 {
 			// The v.PartitionedTable collects the partitioned table.
 			// Replace the original table with the partitioned table to support partition selection.
@@ -3052,7 +3078,7 @@ func (b *executorBuilder) buildUpdate(v *physicalop.Update) exec.Executor {
 			// Using the table in v.PartitionedTable returns a proper error, while using the original table can't.
 			for _, p := range v.PartitionedTable {
 				if info.TblID == p.Meta().ID {
-					tblID2table[info.TblID] = p
+					tbl = p
 				}
 			}
 		}
@@ -3062,6 +3088,11 @@ func (b *executorBuilder) buildUpdate(v *physicalop.Update) exec.Executor {
 			intest.AssertNoError(plannercore.CheckMViewUpdatable(sv, tbl.Meta(), "", "UPDATE"))
 			return true
 		})
+		tbl = b.wrapTableWithMLogIfExists(tbl, tables.MLogSourceUpdate)
+		if b.err != nil {
+			return nil
+		}
+		tblID2table[info.TblID] = tbl
 	}
 	if b.err = b.updateForUpdateTS(); b.err != nil {
 		return nil
@@ -3127,13 +3158,18 @@ func (b *executorBuilder) buildDelete(v *physicalop.Delete) exec.Executor {
 	b.inDeleteStmt = true
 	tblID2table := make(map[int64]table.Table, len(v.TblColPosInfos))
 	for _, info := range v.TblColPosInfos {
-		tblID2table[info.TblID], _ = b.is.TableByID(context.Background(), info.TblID)
+		tbl, _ := b.is.TableByID(context.Background(), info.TblID)
 		// Planner already rejects DML on MV/mlog tables; this catches bypass bugs.
 		intest.AssertFunc(func() bool {
 			sv := b.sctx.GetSessionVars()
-			intest.AssertNoError(plannercore.CheckMViewUpdatable(sv, tblID2table[info.TblID].Meta(), "", "DELETE"))
+			intest.AssertNoError(plannercore.CheckMViewUpdatable(sv, tbl.Meta(), "", "DELETE"))
 			return true
 		})
+		tbl = b.wrapTableWithMLogIfExists(tbl, tables.MLogSourceDelete)
+		if b.err != nil {
+			return nil
+		}
+		tblID2table[info.TblID] = tbl
 	}
 
 	if b.err = b.updateForUpdateTS(); b.err != nil {
@@ -3162,6 +3198,38 @@ func (b *executorBuilder) buildDelete(v *physicalop.Delete) exec.Executor {
 		return nil
 	}
 	return deleteExec
+}
+
+// wrapTableWithMLogIfExists wraps a base table with its MLog table when configured.
+func (b *executorBuilder) wrapTableWithMLogIfExists(tbl table.Table, sourceStmt tables.MLogSourceStmt) table.Table {
+	if tbl == nil {
+		return nil
+	}
+	meta := tbl.Meta()
+	if meta == nil || meta.MaterializedViewBase == nil || meta.MaterializedViewBase.MLogID == 0 {
+		return tbl
+	}
+	if meta.GetPartitionInfo() != nil {
+		b.err = plannererrors.ErrNotSupportedYet.GenWithStackByArgs("materialized view log on partitioned tables")
+		return nil
+	}
+	mlogID := meta.MaterializedViewBase.MLogID
+	mlogTable, ok := b.is.TableByID(context.Background(), mlogID)
+	if !ok {
+		b.err = errors.Errorf(
+			"cannot get materialized view log table id=%d (base=%s id=%d)",
+			mlogID,
+			meta.Name.O,
+			meta.ID,
+		)
+		return nil
+	}
+	wrapped, err := tables.WrapTableWithMaterializedViewLog(tbl, mlogTable, sourceStmt)
+	if err != nil {
+		b.err = err
+		return nil
+	}
+	return wrapped
 }
 
 func (b *executorBuilder) updateForUpdateTS() error {

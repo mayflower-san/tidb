@@ -798,6 +798,124 @@ func TestShowCreateTable(t *testing.T) {
 	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied))
 }
 
+func TestExchangePartitionChecksTargetTablePrivileges(t *testing.T) {
+	store := createStoreAndPrepareDB(t)
+	rootTk := testkit.NewTestKit(t, store)
+	rootTk.MustExec(`CREATE DATABASE exchange_src`)
+	rootTk.MustExec(`CREATE DATABASE exchange_dst`)
+	rootTk.MustExec(`CREATE TABLE exchange_src.pt (a int primary key) PARTITION BY RANGE (a) (
+		PARTITION p0 VALUES LESS THAN (100),
+		PARTITION p1 VALUES LESS THAN (200)
+	)`)
+	rootTk.MustExec(`CREATE TABLE exchange_dst.nt (a int primary key)`)
+	rootTk.MustExec(`CREATE USER 'exchange_low'@'%'`)
+	rootTk.MustExec(`GRANT ALTER, DROP ON exchange_src.* TO 'exchange_low'@'%'`)
+
+	tk := testkit.NewTestKit(t, store)
+	authLow := func() {
+		require.NoError(t, tk.Session().Auth(&auth.UserIdentity{
+			Username: "exchange_low", Hostname: "%", AuthUsername: "exchange_low", AuthHostname: "%",
+		}, nil, nil, nil))
+	}
+	exchange := func() error {
+		authLow()
+		return tk.ExecToErr(`ALTER TABLE exchange_src.pt EXCHANGE PARTITION p0 WITH TABLE exchange_dst.nt`)
+	}
+
+	// EXCHANGE PARTITION swaps the data of both tables, so to match MySQL it requires
+	// ALTER, INSERT, CREATE and DROP on BOTH the partitioned table (pt) and the
+	// non-partitioned table (nt). Grant them one missing privilege at a time and assert
+	// each is enforced; in particular DROP on nt guards against destroying/replacing nt's
+	// existing data without the DROP privilege.
+
+	// Missing CREATE on the target table nt.
+	err := exchange()
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied))
+	require.Contains(t, err.Error(), "CREATE command denied")
+	require.Contains(t, err.Error(), "'nt'")
+
+	// nt now has CREATE+INSERT, but the partitioned table pt still lacks INSERT.
+	rootTk.MustExec(`GRANT CREATE, INSERT ON exchange_dst.* TO 'exchange_low'@'%'`)
+	err = exchange()
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied))
+	require.Contains(t, err.Error(), "INSERT command denied")
+	require.Contains(t, err.Error(), "'pt'")
+
+	// pt now has INSERT+CREATE, but the target table nt still lacks ALTER.
+	rootTk.MustExec(`GRANT INSERT, CREATE ON exchange_src.* TO 'exchange_low'@'%'`)
+	err = exchange()
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied))
+	require.Contains(t, err.Error(), "ALTER command denied")
+	require.Contains(t, err.Error(), "'nt'")
+
+	// nt now has ALTER, but still lacks DROP: exchanging replaces nt's existing data, which
+	// MySQL gates behind DROP on nt. Without DROP the statement must still be denied.
+	rootTk.MustExec(`GRANT ALTER ON exchange_dst.* TO 'exchange_low'@'%'`)
+	err = exchange()
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied))
+	require.Contains(t, err.Error(), "DROP command denied")
+	require.Contains(t, err.Error(), "'nt'")
+
+	// Full MySQL-aligned privilege set on both tables -> allowed.
+	rootTk.MustExec(`GRANT DROP ON exchange_dst.* TO 'exchange_low'@'%'`)
+	authLow()
+	tk.MustExec(`ALTER TABLE exchange_src.pt EXCHANGE PARTITION p0 WITH TABLE exchange_dst.nt`)
+}
+
+func TestExchangePartitionRejectsReservedSystemTableTarget(t *testing.T) {
+	store := createStoreAndPrepareDB(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec(`CREATE DATABASE exchange_reserved`)
+	tk.MustExec(`CREATE TABLE exchange_reserved.pt (a int primary key) PARTITION BY RANGE (a) (
+		PARTITION p0 VALUES LESS THAN (100),
+		PARTITION p1 VALUES LESS THAN (200)
+	)`)
+
+	err := tk.ExecToErr(`ALTER TABLE exchange_reserved.pt EXCHANGE PARTITION p0 WITH TABLE mysql.tidb_ddl_job`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Exchange partition on system table 'mysql.tidb_ddl_job'")
+}
+
+func TestRenameTablesChecksAllPairsPrivileges(t *testing.T) {
+	store := createStoreAndPrepareDB(t)
+
+	rootTk := testkit.NewTestKit(t, store)
+	rootTk.MustExec(`CREATE DATABASE rename_priv_atk`)
+	rootTk.MustExec(`CREATE DATABASE rename_priv_vic`)
+	rootTk.MustExec(`CREATE USER 'rename_low'@'%'`)
+	rootTk.MustExec(`GRANT ALL PRIVILEGES ON rename_priv_atk.* TO 'rename_low'@'%'`)
+	rootTk.MustExec(`CREATE TABLE rename_priv_atk.pair0a (id INT)`)
+	rootTk.MustExec(`CREATE TABLE rename_priv_atk.pair0b (id INT)`)
+	rootTk.MustExec(`CREATE TABLE rename_priv_vic.secret (id INT)`)
+
+	tk := testkit.NewTestKit(t, store)
+	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{
+		Username:     "rename_low",
+		Hostname:     "localhost",
+		AuthUsername: "rename_low",
+		AuthHostname: "%",
+	}, nil, nil, nil))
+
+	tk.MustGetErrCode(`RENAME TABLE rename_priv_atk.pair0a TO rename_priv_atk.pair0a_tmp,
+		rename_priv_vic.secret TO rename_priv_atk.secret_stolen`, errno.ErrTableaccessDenied)
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0a'`).Check(testkit.Rows("pair0a"))
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0a_tmp'`).Check(testkit.Rows())
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_vic LIKE 'secret'`).Check(testkit.Rows("secret"))
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'secret_stolen'`).Check(testkit.Rows())
+
+	tk.MustGetErrCode(`RENAME TABLE rename_priv_atk.pair0a TO rename_priv_atk.pair0a_tmp,
+		rename_priv_atk.pair0b TO rename_priv_vic.pair0b_tmp`, errno.ErrTableaccessDenied)
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0a'`).Check(testkit.Rows("pair0a"))
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0a_tmp'`).Check(testkit.Rows())
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0b'`).Check(testkit.Rows("pair0b"))
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_vic LIKE 'pair0b_tmp'`).Check(testkit.Rows())
+
+	tk.MustExec(`RENAME TABLE rename_priv_atk.pair0a TO rename_priv_atk.pair0a_tmp,
+		rename_priv_atk.pair0b TO rename_priv_atk.pair0b_tmp`)
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0a_tmp'`).Check(testkit.Rows("pair0a_tmp"))
+	rootTk.MustQuery(`SHOW TABLES FROM rename_priv_atk LIKE 'pair0b_tmp'`).Check(testkit.Rows("pair0b_tmp"))
+}
+
 func TestAnalyzeTable(t *testing.T) {
 	store := createStoreAndPrepareDB(t)
 
@@ -1691,7 +1809,7 @@ func TestGrantOptionAndRevoke(t *testing.T) {
 		Hostname: "localhost",
 	}, nil, nil, nil)
 
-	tk.MustQuery(`SHOW GRANTS FOR u1`).Check(testkit.Rows("GRANT SELECT ON *.* TO 'u1'@'%' WITH GRANT OPTION", "GRANT UPDATE,DELETE ON `db`.* TO 'u1'@'%'"))
+	tk.MustQuery(`SHOW GRANTS FOR u1`).Check(testkit.Rows("GRANT SELECT ON *.* TO `u1`@`%` WITH GRANT OPTION", "GRANT UPDATE,DELETE ON `db`.* TO `u1`@`%`"))
 
 	tk.MustExec("GRANT SELECT ON d1.* to u2")
 	tk.MustExec("GRANT SELECT ON d2.* to u2 WITH GRANT OPTION")
@@ -1699,18 +1817,18 @@ func TestGrantOptionAndRevoke(t *testing.T) {
 	tk.MustExec("GRANT SELECT ON d4.* to u2")
 	tk.MustExec("GRANT SELECT ON d5.* to u2")
 	tk.MustQuery(`SHOW GRANTS FOR u2;`).Sort().Check(testkit.Rows(
-		"GRANT SELECT ON `d1`.* TO 'u2'@'%'",
-		"GRANT SELECT ON `d2`.* TO 'u2'@'%' WITH GRANT OPTION",
-		"GRANT SELECT ON `d3`.* TO 'u2'@'%'",
-		"GRANT SELECT ON `d4`.* TO 'u2'@'%'",
-		"GRANT SELECT ON `d5`.* TO 'u2'@'%'",
-		"GRANT USAGE ON *.* TO 'u2'@'%'",
+		"GRANT SELECT ON `d1`.* TO `u2`@`%`",
+		"GRANT SELECT ON `d2`.* TO `u2`@`%` WITH GRANT OPTION",
+		"GRANT SELECT ON `d3`.* TO `u2`@`%`",
+		"GRANT SELECT ON `d4`.* TO `u2`@`%`",
+		"GRANT SELECT ON `d5`.* TO `u2`@`%`",
+		"GRANT USAGE ON *.* TO `u2`@`%`",
 	))
 
 	tk.MustExec("grant all on hchwang.* to u3 with grant option")
-	tk.MustQuery(`SHOW GRANTS FOR u3;`).Check(testkit.Rows("GRANT USAGE ON *.* TO 'u3'@'%'", "GRANT ALL PRIVILEGES ON `hchwang`.* TO 'u3'@'%' WITH GRANT OPTION"))
+	tk.MustQuery(`SHOW GRANTS FOR u3;`).Check(testkit.Rows("GRANT USAGE ON *.* TO `u3`@`%`", "GRANT ALL PRIVILEGES ON `hchwang`.* TO `u3`@`%` WITH GRANT OPTION"))
 	tk.MustExec("revoke all on hchwang.* from u3")
-	tk.MustQuery(`SHOW GRANTS FOR u3;`).Check(testkit.Rows("GRANT USAGE ON *.* TO 'u3'@'%'", "GRANT USAGE ON `hchwang`.* TO 'u3'@'%' WITH GRANT OPTION"))
+	tk.MustQuery(`SHOW GRANTS FOR u3;`).Check(testkit.Rows("GRANT USAGE ON *.* TO `u3`@`%`", "GRANT USAGE ON `hchwang`.* TO `u3`@`%` WITH GRANT OPTION"))
 
 	// Same again but with column privileges.
 
@@ -1719,9 +1837,9 @@ func TestGrantOptionAndRevoke(t *testing.T) {
 	tk.MustExec("grant all on test.testgrant to u3 with grant option")
 	tk.MustExec("revoke all on test.testgrant from u3")
 	tk.MustQuery(`SHOW GRANTS FOR u3`).Sort().Check(testkit.Rows(
-		"GRANT USAGE ON *.* TO 'u3'@'%'",
-		"GRANT USAGE ON `hchwang`.* TO 'u3'@'%' WITH GRANT OPTION",
-		"GRANT USAGE ON `test`.`testgrant` TO 'u3'@'%' WITH GRANT OPTION",
+		"GRANT USAGE ON *.* TO `u3`@`%`",
+		"GRANT USAGE ON `hchwang`.* TO `u3`@`%` WITH GRANT OPTION",
+		"GRANT USAGE ON `test`.`testgrant` TO `u3`@`%` WITH GRANT OPTION",
 	))
 }
 
@@ -1755,30 +1873,30 @@ func TestDashboardClientDynamicPriv(t *testing.T) {
 		Hostname: "localhost",
 	}, nil, nil, nil)
 	tk1.MustQuery("SHOW GRANTS FOR CURRENT_USER()").Check(testkit.Rows(
-		"GRANT USAGE ON *.* TO 'dc_u1'@'%'",
-		"GRANT 'dc_r1'@'%' TO 'dc_u1'@'%'",
+		"GRANT USAGE ON *.* TO `dc_u1`@`%`",
+		"GRANT `dc_r1`@`%` TO `dc_u1`@`%`",
 	))
 	tk.MustExec("GRANT DASHBOARD_CLIENT ON *.* TO dc_r1")
 	tk1.MustQuery("SHOW GRANTS FOR CURRENT_USER()").Check(testkit.Rows(
-		"GRANT USAGE ON *.* TO 'dc_u1'@'%'",
-		"GRANT 'dc_r1'@'%' TO 'dc_u1'@'%'",
-		"GRANT DASHBOARD_CLIENT ON *.* TO 'dc_u1'@'%'",
+		"GRANT USAGE ON *.* TO `dc_u1`@`%`",
+		"GRANT `dc_r1`@`%` TO `dc_u1`@`%`",
+		"GRANT DASHBOARD_CLIENT ON *.* TO `dc_u1`@`%`",
 	))
 	tk.MustExec("REVOKE DASHBOARD_CLIENT ON *.* FROM dc_r1")
 	tk1.MustQuery("SHOW GRANTS FOR CURRENT_USER()").Check(testkit.Rows(
-		"GRANT USAGE ON *.* TO 'dc_u1'@'%'",
-		"GRANT 'dc_r1'@'%' TO 'dc_u1'@'%'",
+		"GRANT USAGE ON *.* TO `dc_u1`@`%`",
+		"GRANT `dc_r1`@`%` TO `dc_u1`@`%`",
 	))
 	tk.MustExec("GRANT DASHBOARD_CLIENT ON *.* TO dc_u1")
 	tk1.MustQuery("SHOW GRANTS FOR CURRENT_USER()").Check(testkit.Rows(
-		"GRANT USAGE ON *.* TO 'dc_u1'@'%'",
-		"GRANT 'dc_r1'@'%' TO 'dc_u1'@'%'",
-		"GRANT DASHBOARD_CLIENT ON *.* TO 'dc_u1'@'%'",
+		"GRANT USAGE ON *.* TO `dc_u1`@`%`",
+		"GRANT `dc_r1`@`%` TO `dc_u1`@`%`",
+		"GRANT DASHBOARD_CLIENT ON *.* TO `dc_u1`@`%`",
 	))
 	tk.MustExec("REVOKE DASHBOARD_CLIENT ON *.* FROM dc_u1")
 	tk1.MustQuery("SHOW GRANTS FOR CURRENT_USER()").Check(testkit.Rows(
-		"GRANT USAGE ON *.* TO 'dc_u1'@'%'",
-		"GRANT 'dc_r1'@'%' TO 'dc_u1'@'%'",
+		"GRANT USAGE ON *.* TO `dc_u1`@`%`",
+		"GRANT `dc_r1`@`%` TO `dc_u1`@`%`",
 	))
 }
 
@@ -1799,8 +1917,8 @@ func TestGrantCreateTmpTables(t *testing.T) {
 		Hostname: "localhost",
 	}, nil, nil, nil)
 	tk.MustQuery("SHOW GRANTS FOR u1").Check(testkit.Rows(
-		`GRANT CREATE TEMPORARY TABLES ON *.* TO 'u1'@'%'`,
-		"GRANT CREATE TEMPORARY TABLES ON `create_tmp_table_db`.* TO 'u1'@'%'"))
+		"GRANT CREATE TEMPORARY TABLES ON *.* TO `u1`@`%`",
+		"GRANT CREATE TEMPORARY TABLES ON `create_tmp_table_db`.* TO `u1`@`%`"))
 	tk.MustExec("DROP USER u1")
 	tk.MustExec("DROP DATABASE create_tmp_table_db")
 }
@@ -1977,8 +2095,8 @@ func TestGrantEvent(t *testing.T) {
 		Hostname: "localhost",
 	}, nil, nil, nil)
 	tk.MustQuery("SHOW GRANTS FOR u1").Check(testkit.Rows(
-		`GRANT EVENT ON *.* TO 'u1'@'%'`,
-		"GRANT EVENT ON `event_db`.* TO 'u1'@'%'"))
+		"GRANT EVENT ON *.* TO `u1`@`%`",
+		"GRANT EVENT ON `event_db`.* TO `u1`@`%`"))
 	tk.MustExec("DROP USER u1")
 	tk.MustExec("DROP DATABASE event_db")
 }
@@ -2279,14 +2397,14 @@ func TestShowGrantsSQLMode(t *testing.T) {
 	tk.MustExec(`GRANT Select ON test.* TO 'show_sql_mode'@'localhost';`)
 
 	testShowGrantsSQLMode(t, tk, []string{
-		"GRANT USAGE ON *.* TO 'show_sql_mode'@'localhost'",
-		"GRANT SELECT ON `test`.* TO 'show_sql_mode'@'localhost'",
+		"GRANT USAGE ON *.* TO `show_sql_mode`@`localhost`",
+		"GRANT SELECT ON `test`.* TO `show_sql_mode`@`localhost`",
 	})
 
 	ctx.GetSessionVars().SQLMode = mysql.SetSQLMode(ctx.GetSessionVars().SQLMode, mysql.ModeANSIQuotes)
 	testShowGrantsSQLMode(t, tk, []string{
-		"GRANT USAGE ON *.* TO 'show_sql_mode'@'localhost'",
-		"GRANT SELECT ON \"test\".* TO 'show_sql_mode'@'localhost'",
+		"GRANT USAGE ON *.* TO \"show_sql_mode\"@\"localhost\"",
+		"GRANT SELECT ON \"test\".* TO \"show_sql_mode\"@\"localhost\"",
 	})
 }
 
@@ -2496,4 +2614,108 @@ func testProtectUserAndRoleWithRestrictedPrivileges(t *testing.T, semVer string)
 func TestProtectUserAndRoleWithRestrictedPrivileges(t *testing.T) {
 	testProtectUserAndRoleWithRestrictedPrivileges(t, sem.V1)
 	testProtectUserAndRoleWithRestrictedPrivileges(t, sem.V2)
+}
+
+func TestInsertValuesSubqueryChecksSelectPrivilege(t *testing.T) {
+	store := createStoreAndPrepareDB(t)
+	rootTk := testkit.NewTestKit(t, store)
+	rootTk.MustExec(`CREATE DATABASE insert_subq_secret`)
+	rootTk.MustExec(`CREATE TABLE insert_subq_secret.victim (id INT PRIMARY KEY, secret VARCHAR(32))`)
+	rootTk.MustExec(`INSERT INTO insert_subq_secret.victim VALUES (1, 'topsecret')`)
+	rootTk.MustExec(`CREATE DATABASE insert_subq_atk`)
+	rootTk.MustExec(`CREATE TABLE insert_subq_atk.exfil (id INT, v VARCHAR(64))`)
+	rootTk.MustExec(`CREATE USER 'insert_subq_low'@'%'`)
+	// Only the attacker's own schema is granted; the victim schema is off limits.
+	rootTk.MustExec(`GRANT SELECT, INSERT ON insert_subq_atk.* TO 'insert_subq_low'@'%'`)
+
+	tk := testkit.NewTestKit(t, store)
+	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{
+		Username: "insert_subq_low", Hostname: "%", AuthUsername: "insert_subq_low", AuthHostname: "%",
+	}, nil, nil, nil))
+
+	// A scalar subquery in the VALUES list must require SELECT on the source table,
+	// exactly like `INSERT ... SELECT` does.
+	err := tk.ExecToErr(`INSERT INTO insert_subq_atk.exfil VALUES (1, (SELECT secret FROM insert_subq_secret.victim WHERE id = 1))`)
+	require.Error(t, err)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+	require.Contains(t, err.Error(), "SELECT command denied")
+	require.Contains(t, err.Error(), "'victim'")
+
+	// The same read through INSERT ... SELECT is already checked.
+	err = tk.ExecToErr(`INSERT INTO insert_subq_atk.exfil SELECT id, secret FROM insert_subq_secret.victim`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied))
+
+	// Once SELECT is granted the statement is allowed and the value is written.
+	rootTk.MustExec(`GRANT SELECT ON insert_subq_secret.* TO 'insert_subq_low'@'%'`)
+	tk.MustExec(`INSERT INTO insert_subq_atk.exfil VALUES (2, (SELECT secret FROM insert_subq_secret.victim WHERE id = 1))`)
+	rootTk.MustQuery(`SELECT v FROM insert_subq_atk.exfil WHERE id = 2`).Check(testkit.Rows("topsecret"))
+}
+
+func TestInsertReturningChecksSelectPrivilege(t *testing.T) {
+	store := createStoreAndPrepareDB(t)
+	rootTk := testkit.NewTestKit(t, store)
+	rootTk.MustExec(`CREATE DATABASE insert_ret_priv`)
+	rootTk.MustExec(`CREATE TABLE insert_ret_priv.t (id INT PRIMARY KEY, secret VARCHAR(32))`)
+	rootTk.MustExec(`INSERT INTO insert_ret_priv.t VALUES (1, 'topsecret')`)
+	rootTk.MustExec(`CREATE USER 'insert_ret_low'@'%'`)
+	rootTk.MustExec(`GRANT INSERT, UPDATE ON insert_ret_priv.t TO 'insert_ret_low'@'%'`)
+
+	tk := testkit.NewTestKit(t, store)
+	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{
+		Username: "insert_ret_low", Hostname: "%", AuthUsername: "insert_ret_low", AuthHostname: "%",
+	}, nil, nil, nil))
+
+	// RETURNING reads the row that was written, so it needs SELECT on the columns it reads.
+	err := tk.ExecToErr(`INSERT INTO insert_ret_priv.t VALUES (2, 'x') RETURNING secret`)
+	require.Error(t, err)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+	require.Contains(t, err.Error(), "SELECT command denied")
+	require.Contains(t, err.Error(), "'t'")
+
+	// `ON DUPLICATE KEY UPDATE` returns the row as it stands after the update, so the value
+	// returned here is the one that was already in the table.
+	err = tk.ExecToErr(
+		`INSERT INTO insert_ret_priv.t VALUES (1, 'x') ON DUPLICATE KEY UPDATE id = id RETURNING secret`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+
+	// A column inside an expression is read just the same, and so is every column `*`
+	// expands to.
+	err = tk.ExecToErr(`INSERT INTO insert_ret_priv.t VALUES (3, 'x') RETURNING concat(secret, '!')`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+	err = tk.ExecToErr(`INSERT INTO insert_ret_priv.t VALUES (4, 'x') RETURNING *`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+
+	// An expression that reads no column of the target table needs no SELECT.
+	tk.MustQuery(`INSERT INTO insert_ret_priv.t VALUES (5, 'x') RETURNING 1`).Check(testkit.Rows("1"))
+
+	// A column-level grant covers the column it was granted on, and nothing else.
+	rootTk.MustExec(`GRANT SELECT (id) ON insert_ret_priv.t TO 'insert_ret_low'@'%'`)
+	tk.MustQuery(`INSERT INTO insert_ret_priv.t VALUES (6, 'x') RETURNING id`).Check(testkit.Rows("6"))
+	err = tk.ExecToErr(`INSERT INTO insert_ret_priv.t VALUES (7, 'x') RETURNING id, secret`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+
+	// SELECT on the table returns the whole row.
+	rootTk.MustExec(`GRANT SELECT ON insert_ret_priv.t TO 'insert_ret_low'@'%'`)
+	tk.MustQuery(`INSERT INTO insert_ret_priv.t VALUES (8, 'y') RETURNING id, secret`).Check(testkit.Rows("8 y"))
+
+	// A prepared statement is checked on every execution, not only when it is prepared, so
+	// revoking the privilege stops a plan that is already cached.
+	tk.MustExec(`PREPARE ret FROM 'INSERT INTO insert_ret_priv.t VALUES (?, ''z'') RETURNING secret'`)
+	tk.MustExec(`SET @id = 9`)
+	tk.MustQuery(`EXECUTE ret USING @id`).Check(testkit.Rows("z"))
+	rootTk.MustExec(`REVOKE SELECT ON insert_ret_priv.t FROM 'insert_ret_low'@'%'`)
+	tk.MustExec(`SET @id = 10`)
+	err = tk.ExecToErr(`EXECUTE ret USING @id`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+
+	// _tidb_rowid is not a column a privilege can be granted on, so it takes SELECT on the
+	// table.
+	rootTk.MustExec(`CREATE TABLE insert_ret_priv.nonclustered (id INT PRIMARY KEY NONCLUSTERED)`)
+	rootTk.MustExec(`GRANT INSERT ON insert_ret_priv.nonclustered TO 'insert_ret_low'@'%'`)
+	err = tk.ExecToErr(`INSERT INTO insert_ret_priv.nonclustered VALUES (1) RETURNING _tidb_rowid`)
+	require.True(t, terror.ErrorEqual(err, plannererrors.ErrTableaccessDenied), "unexpected error: %v", err)
+	rootTk.MustExec(`GRANT SELECT ON insert_ret_priv.nonclustered TO 'insert_ret_low'@'%'`)
+	// The value is an allocated rowid, so only its presence is asserted.
+	require.Len(t, tk.MustQuery(
+		`INSERT INTO insert_ret_priv.nonclustered VALUES (2) RETURNING _tidb_rowid`).Rows(), 1)
 }

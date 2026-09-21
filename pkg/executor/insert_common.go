@@ -68,12 +68,12 @@ type embedTextGeneratedColumn struct {
 type InsertValues struct {
 	exec.BaseExecutor
 
-	rowCount                    uint64
-	curBatchCnt                 uint64
-	maxRowsInBatch              uint64
-	lastInsertID                uint64
-	recordRUV2RowsColMultiply   bool
-	ruv2RecordedRowsColMultiply int64
+	writeStats *execdetails.WriteRuntimeStats
+
+	rowCount       uint64
+	curBatchCnt    uint64
+	maxRowsInBatch uint64
+	lastInsertID   uint64
 
 	SelectExec exec.Executor
 
@@ -114,32 +114,6 @@ type InsertValues struct {
 	fkCascades []*FKCascadeExec
 
 	ignoreErr bool
-}
-
-func (e *InsertValues) rowsColMultiply() int64 {
-	colCount := len(e.insertColumns)
-	if e.rowCount == 0 || colCount == 0 {
-		return 0
-	}
-
-	const maxInt64 = uint64(1<<63 - 1)
-	if e.rowCount > maxInt64/uint64(colCount) {
-		return int64(maxInt64)
-	}
-	return int64(e.rowCount * uint64(colCount))
-}
-
-func (e *InsertValues) recordRowsColMultiply2RUV2Metrics() {
-	if !e.recordRUV2RowsColMultiply {
-		return
-	}
-	current := e.rowsColMultiply()
-	delta := current - e.ruv2RecordedRowsColMultiply
-	if delta <= 0 {
-		return
-	}
-	recordInsertRowsColMultiply2Metrics(e.Ctx().GetSessionVars(), delta)
-	e.ruv2RecordedRowsColMultiply = current
 }
 
 type defaultVal struct {
@@ -318,7 +292,6 @@ func insertRows(ctx context.Context, base insertCommon) (err error) {
 			if err = base.exec(ctx, rows); err != nil {
 				return err
 			}
-			e.recordRowsColMultiply2RUV2Metrics()
 			rows = rows[:0]
 			memTracker.Consume(-memUsageOfRows)
 			memUsageOfRows = 0
@@ -344,7 +317,6 @@ func insertRows(ctx context.Context, base insertCommon) (err error) {
 	if err != nil {
 		return err
 	}
-	e.recordRowsColMultiply2RUV2Metrics()
 	memTracker.Consume(-memUsageOfRows)
 	return nil
 }
@@ -603,7 +575,6 @@ func insertRowsFromSelect(ctx context.Context, base insertCommon) error {
 				if err = base.exec(ctx, rows); err != nil {
 					return err
 				}
-				e.recordRowsColMultiply2RUV2Metrics()
 				rows = rows[:0]
 				extraColsInSel = extraColsInSel[:0]
 				totalMemDelta += -memUsageOfRows - memUsageOfExtraCols
@@ -629,7 +600,6 @@ func insertRowsFromSelect(ctx context.Context, base insertCommon) error {
 		if err != nil {
 			return err
 		}
-		e.recordRowsColMultiply2RUV2Metrics()
 		rows = rows[:0]
 		extraColsInSel = extraColsInSel[:0]
 		memTracker.Consume(-memUsageOfRows - memUsageOfExtraCols - chkMemUsage)
@@ -1676,25 +1646,34 @@ func (e *InsertValues) equalDatumsAsBinary(a []types.Datum, b []types.Datum) (bo
 }
 
 func (e *InsertValues) addRecord(ctx context.Context, row []types.Datum, dupKeyCheck table.DupKeyCheckMode) error {
-	return e.addRecordWithAutoIDHint(ctx, row, 0, dupKeyCheck)
+	_, err := e.addRecordWithAutoIDHintAndHandle(ctx, row, 0, dupKeyCheck)
+	return err
 }
 
 func (e *InsertValues) addRecordWithAutoIDHint(
 	ctx context.Context, row []types.Datum, reserveAutoIDCount int, dupKeyCheck table.DupKeyCheckMode,
 ) (err error) {
+	_, err = e.addRecordWithAutoIDHintAndHandle(ctx, row, reserveAutoIDCount, dupKeyCheck)
+	return err
+}
+
+func (e *InsertValues) addRecordWithAutoIDHintAndHandle(
+	ctx context.Context, row []types.Datum, reserveAutoIDCount int, dupKeyCheck table.DupKeyCheckMode,
+) (kv.Handle, error) {
 	vars := e.Ctx().GetSessionVars()
 	txn, err := e.Ctx().Txn(true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pessimisticLazyCheck := getPessimisticLazyCheckMode(vars)
+	var handle kv.Handle
 	if reserveAutoIDCount > 0 {
-		_, err = e.Table.AddRecord(e.Ctx().GetTableCtx(), txn, row, table.WithCtx(ctx), table.WithReserveAutoIDHint(reserveAutoIDCount), dupKeyCheck, pessimisticLazyCheck)
+		handle, err = e.Table.AddRecord(e.Ctx().GetTableCtx(), txn, row, table.WithCtx(ctx), table.WithReserveAutoIDHint(reserveAutoIDCount), dupKeyCheck, pessimisticLazyCheck)
 	} else {
-		_, err = e.Table.AddRecord(e.Ctx().GetTableCtx(), txn, row, table.WithCtx(ctx), dupKeyCheck, pessimisticLazyCheck)
+		handle, err = e.Table.AddRecord(e.Ctx().GetTableCtx(), txn, row, table.WithCtx(ctx), dupKeyCheck, pessimisticLazyCheck)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	vars.StmtCtx.AddAffectedRows(1)
 	if e.lastInsertID != 0 {
@@ -1704,7 +1683,7 @@ func (e *InsertValues) addRecordWithAutoIDHint(
 		for _, fkc := range e.fkChecks {
 			err = fkc.insertRowNeedToCheck(vars.StmtCtx, row)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -1714,7 +1693,7 @@ func (e *InsertValues) addRecordWithAutoIDHint(
 		vars.TxnCtx.InsertTTLRowsCount++
 	}
 
-	return nil
+	return handle, nil
 }
 
 // CreateSession will be assigned by session package.
@@ -1845,4 +1824,20 @@ func (e *InsertRuntimeStat) Merge(other execdetails.RuntimeStats) {
 // Tp implements the RuntimeStats interface.
 func (*InsertRuntimeStat) Tp() int {
 	return execdetails.TpInsertRuntimeStat
+}
+
+// recordWriteCPUWork counts each processed target row even when no KV value changes.
+// Clustered primary keys are part of the row key; columnar indexes do not add KV index work.
+func recordWriteCPUWork(stats *execdetails.WriteRuntimeStats, tbl table.Table, rows int) {
+	if stats == nil || rows == 0 {
+		return
+	}
+	factor := 1
+	for _, idx := range tbl.Indices() {
+		if idx.Meta().IsColumnarIndex() || (tbl.Meta().IsCommonHandle && idx.Meta().Primary) {
+			continue
+		}
+		factor++
+	}
+	stats.CPUWork += float64(rows) * float64(factor)
 }

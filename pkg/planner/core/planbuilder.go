@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/bindinfo"
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/config/deploymode"
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/expression"
@@ -582,14 +583,6 @@ func (b *PlanBuilder) HandleUnusedViewHints() {
 	b.hintProcessor.SetWarns(b.hintProcessor.HandleUnusedViewHints(b.hintState, nil))
 }
 
-func (b *PlanBuilder) recordPlanBuilderMetric() {
-	if b.ctx != nil {
-		if vars := b.ctx.GetSessionVars(); vars != nil && vars.RUV2Metrics != nil {
-			vars.RUV2Metrics.AddPlanCnt(1)
-		}
-	}
-}
-
 // Build builds the ast node to a Plan.
 func (b *PlanBuilder) Build(ctx context.Context, node *resolve.NodeW) (base.Plan, error) {
 	err := b.checkSEMStmt(node.Node)
@@ -601,8 +594,6 @@ func (b *PlanBuilder) Build(ctx context.Context, node *resolve.NodeW) (base.Plan
 	// context, so it's ok to override it.
 	b.resolveCtx = node.GetResolveContext()
 	b.optFlag |= rule.FlagPruneColumns
-	// Count every recursive build invocation because RU v2 charges plan work per build step.
-	b.recordPlanBuilderMetric()
 	switch x := node.Node.(type) {
 	case *ast.AdminStmt:
 		return b.buildAdmin(ctx, x)
@@ -2697,7 +2688,7 @@ func (b *PlanBuilder) buildAnalyzeFullSamplingTask(
 		return err
 	}
 
-	astOpts, err := handleAnalyzeOptions(as.AnalyzeOpts)
+	astOpts, astResets, err := handleAnalyzeOptions(as.AnalyzeOpts)
 	if err != nil {
 		return err
 	}
@@ -2738,7 +2729,7 @@ func (b *PlanBuilder) buildAnalyzeFullSamplingTask(
 		return err
 	}
 
-	optionsMap, colsInfoMap, err := b.genV2AnalyzeOptions(persistOpts, tbl, isAnalyzeTable, physicalIDs, astOpts, as.ColumnChoice, astColList, &predicateCols, &mustAnalyzedCols, mustAllColumns)
+	optionsMap, colsInfoMap, err := b.genV2AnalyzeOptions(persistOpts, tbl, isAnalyzeTable, physicalIDs, astOpts, astResets, as.ColumnChoice, astColList, &predicateCols, &mustAnalyzedCols, mustAllColumns)
 	if err != nil {
 		return err
 	}
@@ -2831,6 +2822,7 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 	isAnalyzeTable bool,
 	physicalIDs []int64,
 	astOpts map[ast.AnalyzeOptionType]uint64,
+	astResets map[ast.AnalyzeOptionType]struct{},
 	astColChoice ast.ColumnChoice,
 	astColList []*model.ColumnInfo,
 	predicateCols, mustAnalyzedCols *calcOnceMap,
@@ -2847,8 +2839,9 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 	// Because the plan is generated for each partition individually, each partition uses its own statistics;
 	// In dynamic mode, there is no partitioning, and a global plan is generated for the whole table, so a global statistic is needed;
 	dynamicPrune := variable.PartitionPruneMode(b.ctx.GetSessionVars().PartitionPruneMode.Load()) == variable.Dynamic
-	if !isAnalyzeTable && dynamicPrune && (len(astOpts) > 0 || astColChoice != ast.DefaultChoice) {
-		astOpts = make(map[ast.AnalyzeOptionType]uint64, 0)
+	if !isAnalyzeTable && dynamicPrune && (len(astOpts) > 0 || len(astResets) > 0 || astColChoice != ast.DefaultChoice) {
+		astOpts = map[ast.AnalyzeOptionType]uint64{}
+		astResets = map[ast.AnalyzeOptionType]struct{}{}
 		astColChoice = ast.DefaultChoice
 		astColList = make([]*model.ColumnInfo, 0)
 		b.ctx.GetSessionVars().StmtCtx.AppendWarning(errors.NewNoStackError("Ignore columns and options when analyze partition in dynamic mode"))
@@ -2862,9 +2855,11 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 	tblOpts := tblSavedOpts
 	tblColChoice := tblSavedColChoice
 	tblColList := tblSavedColList
+	resetOpts := make(map[ast.AnalyzeOptionType]struct{})
 	if isAnalyzeTable {
-		tblOpts = mergeAnalyzeOptions(astOpts, tblSavedOpts)
+		tblOpts = mergeAnalyzeOptions(astOpts, astResets, tblSavedOpts)
 		tblColChoice, tblColList = pickColumnList(astColChoice, astColList, tblSavedColChoice, tblSavedColList)
+		maps.Copy(resetOpts, astResets)
 	}
 
 	tblFilledOpts := fillAnalyzeOptions(tblOpts)
@@ -2878,6 +2873,7 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 		PhyTableID:  tbl.TableInfo.ID,
 		RawOpts:     tblOpts,
 		FilledOpts:  tblFilledOpts,
+		ResetOpts:   resetOpts,
 		ColChoice:   tblColChoice,
 		ColumnList:  tblColList,
 		IsPartition: false,
@@ -2907,11 +2903,24 @@ func (b *PlanBuilder) genV2AnalyzeOptions(
 			if err != nil {
 				return nil, nil, err
 			}
+			stmtResets := astResets
+			if !isAnalyzeTable {
+				// A partition-targeted DEFAULT resets only the partition's own
+				// persisted value; the partition then follows the table-level
+				// saved value again if one exists, otherwise the system default.
+				// So drop the reset from the partition's saved options and do not
+				// let it reach the merge below, which would also drop the
+				// table-level value.
+				for optType := range astResets {
+					delete(parSavedOpts, optType)
+				}
+				stmtResets = nil
+			}
 			// merge partition level options with table level options firstly
-			savedOpts := mergeAnalyzeOptions(parSavedOpts, tblSavedOpts)
+			savedOpts := overrideAnalyzeOptions(parSavedOpts, tblSavedOpts)
 			savedColChoice, savedColList := pickColumnList(parSavedColChoice, parSavedColList, tblSavedColChoice, tblSavedColList)
 			// then merge statement level options
-			mergedOpts := mergeAnalyzeOptions(astOpts, savedOpts)
+			mergedOpts := mergeAnalyzeOptions(astOpts, stmtResets, savedOpts)
 			filledMergedOpts := fillAnalyzeOptions(mergedOpts)
 			finalColChoice, mergedColList := pickColumnList(astColChoice, astColList, savedColChoice, savedColList)
 			finalColsInfo, finalColList, err := b.getFullAnalyzeColumnsInfo(tbl, finalColChoice, mergedColList, predicateCols, mustAnalyzedCols, mustAllColumns, false)
@@ -2987,15 +2996,33 @@ func (b *PlanBuilder) getSavedAnalyzeOpts(physicalID int64, tblInfo *model.Table
 	}
 }
 
-func mergeAnalyzeOptions(stmtOpts map[ast.AnalyzeOptionType]uint64, savedOpts map[ast.AnalyzeOptionType]uint64) map[ast.AnalyzeOptionType]uint64 {
+// mergeAnalyzeOptions applies statement-level options on top of saved options:
+// an explicit statement option wins, and an option in stmtResets was given as
+// DEFAULT and drops the saved value so the option is unset again and the system
+// default applies.
+func mergeAnalyzeOptions(stmtOpts map[ast.AnalyzeOptionType]uint64, stmtResets map[ast.AnalyzeOptionType]struct{}, savedOpts map[ast.AnalyzeOptionType]uint64) map[ast.AnalyzeOptionType]uint64 {
 	merged := map[ast.AnalyzeOptionType]uint64{}
 	for optType := range ast.AnalyzeOptionString {
 		if stmtOpt, ok := stmtOpts[optType]; ok {
 			merged[optType] = stmtOpt
-		} else if savedOpt, ok := savedOpts[optType]; ok {
+			continue
+		}
+		if _, ok := stmtResets[optType]; ok {
+			continue
+		}
+		if savedOpt, ok := savedOpts[optType]; ok {
 			merged[optType] = savedOpt
 		}
 	}
+	return merged
+}
+
+// overrideAnalyzeOptions returns savedOpts with overrideOpts applied on top,
+// used to layer partition-level saved options over table-level ones.
+func overrideAnalyzeOptions(overrideOpts, savedOpts map[ast.AnalyzeOptionType]uint64) map[ast.AnalyzeOptionType]uint64 {
+	merged := make(map[ast.AnalyzeOptionType]uint64, len(savedOpts)+len(overrideOpts))
+	maps.Copy(merged, savedOpts)
+	maps.Copy(merged, overrideOpts)
 	return merged
 }
 
@@ -3139,29 +3166,54 @@ func AnalyzeOptionDefault() map[ast.AnalyzeOptionType]uint64 {
 	}
 }
 
-// handleAnalyzeOptions validates analyze options and returns only the options
-// explicitly specified in the statement.
-func handleAnalyzeOptions(opts []ast.AnalyzeOpt) (map[ast.AnalyzeOptionType]uint64, error) {
+// handleAnalyzeOptions validates the analyze options explicitly specified in the
+// statement. It returns the options given an explicit value, keyed by option
+// type, and separately the set of options given as DEFAULT, which clears the
+// value persisted in mysql.analyze_options for the analyzed target so that it
+// behaves as if the option had never been persisted for it (genV2AnalyzeOptions
+// decides the fallback: table-level saved value for a partition, otherwise the
+// system default). An option in neither map was not mentioned in the statement,
+// so its persisted value still applies.
+//
+// See ast.AnalyzeOpt for why DEFAULT is the only way to express such a reset.
+func handleAnalyzeOptions(opts []ast.AnalyzeOpt) (map[ast.AnalyzeOptionType]uint64, map[ast.AnalyzeOptionType]struct{}, error) {
 	optMap := make(map[ast.AnalyzeOptionType]uint64, len(analyzeOptionLimit))
+	resetOpts := make(map[ast.AnalyzeOptionType]struct{}, len(analyzeOptionLimit))
 	sampleNum, sampleRate := uint64(0), 0.0
 	for _, opt := range opts {
+		// Options are processed in statement order, so for repeated mentions of
+		// the same option the last one wins, matching the behavior for
+		// duplicated literal options. An option is a value or a reset but never
+		// both, so each branch drops it from the other map.
+		if opt.Value == nil {
+			delete(optMap, opt.Type)
+			resetOpts[opt.Type] = struct{}{}
+			switch opt.Type {
+			case ast.AnalyzeOptNumSamples:
+				sampleNum = 0
+			case ast.AnalyzeOptSampleRate:
+				sampleRate = 0
+			}
+			continue
+		}
+		delete(resetOpts, opt.Type)
 		datumValue := opt.Value.(*driver.ValueExpr).Datum
 		switch opt.Type {
 		case ast.AnalyzeOptNumTopN:
 			v := datumValue.GetUint64()
 			if v > analyzeOptionLimit[opt.Type] {
-				return nil, errors.Errorf("Value of analyze option %s should not be larger than %d", ast.AnalyzeOptionString[opt.Type], analyzeOptionLimit[opt.Type])
+				return nil, nil, errors.Errorf("Value of analyze option %s should not be larger than %d", ast.AnalyzeOptionString[opt.Type], analyzeOptionLimit[opt.Type])
 			}
 			optMap[opt.Type] = v
 		case ast.AnalyzeOptSampleRate:
 			// Only Int/Float/decimal is accepted, so pass nil here is safe.
 			fVal, err := datumValue.ToFloat64(types.DefaultStmtNoWarningContext)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			limit := math.Float64frombits(analyzeOptionLimit[opt.Type])
 			if fVal <= 0 || fVal > limit {
-				return nil, errors.Errorf("Value of analyze option %s should not larger than %f, and should be greater than 0", ast.AnalyzeOptionString[opt.Type], limit)
+				return nil, nil, errors.Errorf("Value of analyze option %s should not larger than %f, and should be greater than 0", ast.AnalyzeOptionString[opt.Type], limit)
 			}
 			sampleRate = fVal
 			optMap[opt.Type] = math.Float64bits(fVal)
@@ -3171,16 +3223,16 @@ func handleAnalyzeOptions(opts []ast.AnalyzeOpt) (map[ast.AnalyzeOptionType]uint
 				sampleNum = v
 			}
 			if v == 0 || v > analyzeOptionLimit[opt.Type] {
-				return nil, errors.Errorf("Value of analyze option %s should be positive and not larger than %d", ast.AnalyzeOptionString[opt.Type], analyzeOptionLimit[opt.Type])
+				return nil, nil, errors.Errorf("Value of analyze option %s should be positive and not larger than %d", ast.AnalyzeOptionString[opt.Type], analyzeOptionLimit[opt.Type])
 			}
 			optMap[opt.Type] = v
 		}
 	}
 	if sampleNum > 0 && sampleRate > 0 {
-		return nil, errors.Errorf("You can only either set the value of the sample num or set the value of the sample rate. Don't set both of them")
+		return nil, nil, errors.Errorf("You can only either set the value of the sample num or set the value of the sample rate. Don't set both of them")
 	}
 
-	return optMap, nil
+	return optMap, resetOpts, nil
 }
 
 func fillAnalyzeOptions(optMap map[ast.AnalyzeOptionType]uint64) map[ast.AnalyzeOptionType]uint64 {
@@ -3207,11 +3259,17 @@ func (b *PlanBuilder) buildAnalyze(as *ast.AnalyzeTableStmt) (base.Plan, error) 
 	// Require INSERT and SELECT privilege for tables.
 	b.requireInsertAndSelectPriv(as.TableNames)
 
-	opts, err := handleAnalyzeOptions(as.AnalyzeOpts)
+	stmtOpts, stmtResets, err := handleAnalyzeOptions(as.AnalyzeOpts)
 	if err != nil {
 		return nil, err
 	}
-	filledOpts := fillAnalyzeOptions(opts)
+	// These options are the fallback used when tidb_persist_analyze_options is
+	// off, so there is no saved value for an option given as DEFAULT to reset and
+	// it just means "use the system default for this run": merging against no
+	// saved options drops it and fillAnalyzeOptions supplies the default. When
+	// persistence is on, the per-table options built by
+	// buildAnalyzeFullSamplingTask take precedence over these in the executor.
+	filledOpts := fillAnalyzeOptions(mergeAnalyzeOptions(stmtOpts, stmtResets, nil))
 
 	if as.IndexFlag {
 		if len(as.IndexNames) == 0 {
@@ -4261,7 +4319,25 @@ func (b *PlanBuilder) buildInsert(ctx context.Context, insert *ast.InsertStmt) (
 		return nil, err
 	}
 	err = insertPlan.BuildOnInsertFKTriggers(b.ctx, b.is, tnW.DBInfo.Name.L)
-	return insertPlan, err
+	if err != nil {
+		return nil, err
+	}
+
+	// The RETURNING clause is built last: it overwrites the plan's schema, and
+	// ResolveIndices above still needs the schema the plan was built with.
+	if len(insert.Returning) > 0 {
+		returningExprs, returningSchema, returningNames, needExtraHandle, err := b.buildReturningClause(
+			ctx, insert.Returning, insertPlan.TableSchema, insertPlan.TableColNames, mockTablePlan, tableInfo, tnW.DBInfo.Name)
+		if err != nil {
+			return nil, err
+		}
+		insertPlan.Returning = returningExprs
+		insertPlan.NeedExtraHandleReturning = needExtraHandle
+		insertPlan.SetSchema(returningSchema)
+		insertPlan.SetOutputNames(returningNames)
+	}
+
+	return insertPlan, nil
 }
 
 func (*PlanBuilder) getAffectCols(insertStmt *ast.InsertStmt, insertPlan *physicalop.Insert) (affectedValuesCols []*table.Column, err error) {
@@ -4289,7 +4365,7 @@ func (*PlanBuilder) getAffectCols(insertStmt *ast.InsertStmt, insertPlan *physic
 	return affectedValuesCols, nil
 }
 
-func (b PlanBuilder) getInsertColExpr(ctx context.Context, insertPlan *physicalop.Insert, mockTablePlan *logicalop.LogicalTableDual, col *table.Column, expr ast.ExprNode, checkRefColumn func(n ast.Node) ast.Node) (outExpr expression.Expression, err error) {
+func (b *PlanBuilder) getInsertColExpr(ctx context.Context, insertPlan *physicalop.Insert, mockTablePlan *logicalop.LogicalTableDual, col *table.Column, expr ast.ExprNode, checkRefColumn func(n ast.Node) ast.Node) (outExpr expression.Expression, err error) {
 	if col.Hidden {
 		return nil, plannererrors.ErrUnknownColumn.GenWithStackByArgs(col.Name, clauseMsg[fieldList])
 	}
@@ -4757,18 +4833,26 @@ func (b *PlanBuilder) buildImportInto(ctx context.Context, ld *ast.ImportIntoStm
 				return nil, plannererrors.ErrNotSupportedWithSem.GenWithStackByArgs("IMPORT INTO from server disk")
 			}
 		}
-		// a nextgen cluster might be shared by multiple tenants, and they might
-		// share the same AWS role to access import-into source data bucket, this
-		// external ID can be used to restrict the access only to the current tenant.
-		// when SEM enabled, we need set it.
+		// A NextGen cluster might be shared by multiple tenants that use the
+		// same AWS role. The external ID restricts access to the intended tenant.
 		if kerneltype.IsNextGen() && sem.IsEnabled() && objstore.IsS3Like(u) {
+			isStarter := deploymode.IsStarter()
+			// TODO: Unify Starter external ID handling with other NextGen deployment modes.
+			if isStarter {
+				if err := checkStarterS3Path(u); err != nil {
+					return nil, err
+				}
+			}
 			if err := checkNextGenS3PathWithSem(u); err != nil {
 				return nil, err
 			}
-			values := u.Query()
-			values.Set(s3like.S3ExternalID, config.GetGlobalKeyspaceName())
-			u.RawQuery = values.Encode()
-			ld.Path = u.String()
+			// Non-Starter deployments derive the external ID from the keyspace.
+			if !isStarter {
+				values := u.Query()
+				values.Set(s3like.S3ExternalID, config.GetGlobalKeyspaceName())
+				u.RawQuery = values.Encode()
+				ld.Path = u.String()
+			}
 		}
 	}
 
@@ -5350,19 +5434,57 @@ func (b *PlanBuilder) buildDDL(ctx context.Context, node ast.DDLNode) (base.Plan
 				b.visitInfo = appendVisitInfo(b.visitInfo, mysql.DropPriv, dbName,
 					v.Table.Name.L, "", authErr)
 
+				newDBName := getLowerDB(spec.NewTable.Schema, b.ctx.GetSessionVars())
 				if b.ctx.GetSessionVars().User != nil {
 					authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("CREATE", b.ctx.GetSessionVars().User.AuthUsername,
 						b.ctx.GetSessionVars().User.AuthHostname, spec.NewTable.Name.L)
 				}
-				b.visitInfo = appendVisitInfo(b.visitInfo, mysql.CreatePriv, dbName,
+				b.visitInfo = appendVisitInfo(b.visitInfo, mysql.CreatePriv, newDBName,
 					spec.NewTable.Name.L, "", authErr)
 
 				if b.ctx.GetSessionVars().User != nil {
 					authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("INSERT", b.ctx.GetSessionVars().User.AuthUsername,
 						b.ctx.GetSessionVars().User.AuthHostname, spec.NewTable.Name.L)
 				}
-				b.visitInfo = appendVisitInfo(b.visitInfo, mysql.InsertPriv, dbName,
+				b.visitInfo = appendVisitInfo(b.visitInfo, mysql.InsertPriv, newDBName,
 					spec.NewTable.Name.L, "", authErr)
+
+				if spec.Tp == ast.AlterTableExchangePartition {
+					// EXCHANGE PARTITION swaps the data of a partition of the partitioned
+					// table with the whole non-partitioned table, mutating BOTH tables. To
+					// match MySQL, ALTER, INSERT, CREATE and DROP are required on both tables.
+					// The shared path above already covers ALTER+DROP on the partitioned
+					// table and CREATE+INSERT on the non-partitioned table; add the remaining
+					// INSERT+CREATE on the partitioned table and ALTER+DROP on the
+					// non-partitioned table. (RENAME TABLE must not require these extras.)
+					if b.ctx.GetSessionVars().User != nil {
+						authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("INSERT", b.ctx.GetSessionVars().User.AuthUsername,
+							b.ctx.GetSessionVars().User.AuthHostname, v.Table.Name.L)
+					}
+					b.visitInfo = appendVisitInfo(b.visitInfo, mysql.InsertPriv, dbName,
+						v.Table.Name.L, "", authErr)
+
+					if b.ctx.GetSessionVars().User != nil {
+						authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("CREATE", b.ctx.GetSessionVars().User.AuthUsername,
+							b.ctx.GetSessionVars().User.AuthHostname, v.Table.Name.L)
+					}
+					b.visitInfo = appendVisitInfo(b.visitInfo, mysql.CreatePriv, dbName,
+						v.Table.Name.L, "", authErr)
+
+					if b.ctx.GetSessionVars().User != nil {
+						authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("ALTER", b.ctx.GetSessionVars().User.AuthUsername,
+							b.ctx.GetSessionVars().User.AuthHostname, spec.NewTable.Name.L)
+					}
+					b.visitInfo = appendVisitInfo(b.visitInfo, mysql.AlterPriv, newDBName,
+						spec.NewTable.Name.L, "", authErr)
+
+					if b.ctx.GetSessionVars().User != nil {
+						authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("DROP", b.ctx.GetSessionVars().User.AuthUsername,
+							b.ctx.GetSessionVars().User.AuthHostname, spec.NewTable.Name.L)
+					}
+					b.visitInfo = appendVisitInfo(b.visitInfo, mysql.DropPriv, newDBName,
+						spec.NewTable.Name.L, "", authErr)
+				}
 			} else if spec.Tp == ast.AlterTableDropPartition || spec.Tp == ast.AlterTableTruncatePartition {
 				if b.ctx.GetSessionVars().User != nil {
 					authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("DROP", b.ctx.GetSessionVars().User.AuthUsername,
@@ -5566,33 +5688,28 @@ func (b *PlanBuilder) buildDDL(ctx context.Context, node ast.DDLNode) (base.Plan
 		b.visitInfo = appendVisitInfo(b.visitInfo, mysql.DropPriv, v.Table.Schema.L,
 			v.Table.Name.L, "", authErr)
 	case *ast.RenameTableStmt:
-		if b.ctx.GetSessionVars().User != nil {
-			authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("ALTER", b.ctx.GetSessionVars().User.AuthUsername,
-				b.ctx.GetSessionVars().User.AuthHostname, v.TableToTables[0].OldTable.Name.L)
+		user := b.ctx.GetSessionVars().User
+		for _, tableToTable := range v.TableToTables {
+			var alterErr, dropErr, createErr, insertErr error
+			if user != nil {
+				alterErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("ALTER", user.AuthUsername,
+					user.AuthHostname, tableToTable.OldTable.Name.L)
+				dropErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("DROP", user.AuthUsername,
+					user.AuthHostname, tableToTable.OldTable.Name.L)
+				createErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("CREATE", user.AuthUsername,
+					user.AuthHostname, tableToTable.NewTable.Name.L)
+				insertErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("INSERT", user.AuthUsername,
+					user.AuthHostname, tableToTable.NewTable.Name.L)
+			}
+			b.visitInfo = appendVisitInfo(b.visitInfo, mysql.AlterPriv, tableToTable.OldTable.Schema.L,
+				tableToTable.OldTable.Name.L, "", alterErr)
+			b.visitInfo = appendVisitInfo(b.visitInfo, mysql.DropPriv, tableToTable.OldTable.Schema.L,
+				tableToTable.OldTable.Name.L, "", dropErr)
+			b.visitInfo = appendVisitInfo(b.visitInfo, mysql.CreatePriv, tableToTable.NewTable.Schema.L,
+				tableToTable.NewTable.Name.L, "", createErr)
+			b.visitInfo = appendVisitInfo(b.visitInfo, mysql.InsertPriv, tableToTable.NewTable.Schema.L,
+				tableToTable.NewTable.Name.L, "", insertErr)
 		}
-		b.visitInfo = appendVisitInfo(b.visitInfo, mysql.AlterPriv, v.TableToTables[0].OldTable.Schema.L,
-			v.TableToTables[0].OldTable.Name.L, "", authErr)
-
-		if b.ctx.GetSessionVars().User != nil {
-			authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("DROP", b.ctx.GetSessionVars().User.AuthUsername,
-				b.ctx.GetSessionVars().User.AuthHostname, v.TableToTables[0].OldTable.Name.L)
-		}
-		b.visitInfo = appendVisitInfo(b.visitInfo, mysql.DropPriv, v.TableToTables[0].OldTable.Schema.L,
-			v.TableToTables[0].OldTable.Name.L, "", authErr)
-
-		if b.ctx.GetSessionVars().User != nil {
-			authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("CREATE", b.ctx.GetSessionVars().User.AuthUsername,
-				b.ctx.GetSessionVars().User.AuthHostname, v.TableToTables[0].NewTable.Name.L)
-		}
-		b.visitInfo = appendVisitInfo(b.visitInfo, mysql.CreatePriv, v.TableToTables[0].NewTable.Schema.L,
-			v.TableToTables[0].NewTable.Name.L, "", authErr)
-
-		if b.ctx.GetSessionVars().User != nil {
-			authErr = plannererrors.ErrTableaccessDenied.GenWithStackByArgs("INSERT", b.ctx.GetSessionVars().User.AuthUsername,
-				b.ctx.GetSessionVars().User.AuthHostname, v.TableToTables[0].NewTable.Name.L)
-		}
-		b.visitInfo = appendVisitInfo(b.visitInfo, mysql.InsertPriv, v.TableToTables[0].NewTable.Schema.L,
-			v.TableToTables[0].NewTable.Name.L, "", authErr)
 	case *ast.RecoverTableStmt:
 		if v.Table == nil {
 			b.visitInfo = appendVisitInfo(b.visitInfo, mysql.SuperPriv, "", "", "", nil)
@@ -6549,12 +6666,32 @@ func checkAlterDDLJobOptValue(opt *AlterDDLJobOpt) error {
 	return nil
 }
 
-// For nextgen IMPORT INTO with SEM, require explicit S3 authentication and
-// disallow explicit S3 external ID unless it is the keyspace name. The keyspace
-// name is used as the S3 external ID.
+// checkStarterS3Path requires every normalized external ID alias to have a
+// non-empty effective value. The caller preserves the original path.
+func checkStarterS3Path(u *url.URL) error {
+	values := u.Query()
+	hasExternalID := false
+	for k, vs := range values {
+		if objstore.NormalizeQueryParameterKey(k) != s3like.S3ExternalID {
+			continue
+		}
+		hasExternalID = len(vs) > 0 && vs[0] != ""
+		if !hasExternalID {
+			break
+		}
+	}
+	if !hasExternalID {
+		return exeerrors.ErrLoadDataInvalidURI.FastGenByArgs(ImportIntoDataSource, "external ID is required for Starter deployments")
+	}
+	return nil
+}
+
+// For nextgen IMPORT INTO with SEM, require explicit S3 authentication. For
+// non-Starter deployments, only allow the keyspace name as the external ID.
 func checkNextGenS3PathWithSem(u *url.URL) error {
 	values := u.Query()
 	expectedExternalID := config.GetGlobalKeyspaceName()
+	isStarter := deploymode.IsStarter()
 	hasAccessKey := false
 	hasSecretAccessKey := false
 	hasRoleARN := false
@@ -6562,9 +6699,11 @@ func checkNextGenS3PathWithSem(u *url.URL) error {
 		normalizedK := objstore.NormalizeQueryParameterKey(k)
 		switch normalizedK {
 		case s3like.S3ExternalID:
-			for _, v := range vs {
-				if v != expectedExternalID {
-					return plannererrors.ErrNotSupportedWithSem.GenWithStackByArgs("IMPORT INTO with explicit external ID")
+			if !isStarter {
+				for _, v := range vs {
+					if v != expectedExternalID {
+						return plannererrors.ErrNotSupportedWithSem.GenWithStackByArgs("IMPORT INTO with explicit external ID")
+					}
 				}
 			}
 		case s3like.S3AccessKey:
@@ -6637,4 +6776,151 @@ func (b *PlanBuilder) checkSEMStmt(stmt ast.Node) error {
 	}
 
 	return plannererrors.ErrNotSupportedWithSem.GenWithStackByArgs(stmtNode.Text())
+}
+
+// buildReturningClause builds the RETURNING clause of an INSERT statement: it turns the
+// RETURNING select_expr list into expressions evaluated over a written row, and returns
+// them together with the schema and the output names they produce.
+//
+// The expressions are evaluated row by row while the rows are written, so they may only
+// refer to the columns of the written row: anything that would need its own plan, such as
+// a correlated subquery, is rejected. Aggregate and window functions are rejected by the
+// expression rewriter itself, because no aggregation mapper is passed to it.
+func (b *PlanBuilder) buildReturningClause(
+	ctx context.Context,
+	returning []*ast.SelectField,
+	tableSchema *expression.Schema,
+	tableNames types.NameSlice,
+	mockPlan *logicalop.LogicalTableDual,
+	tableInfo *model.TableInfo,
+	dbName ast.CIStr,
+) ([]expression.Expression, *expression.Schema, types.NameSlice, bool, error) {
+	// A row of a table without a clustered handle carries _tidb_rowid after its public
+	// columns; the executor fills that slot in with the handle of the written row.
+	inputSchema := tableSchema
+	inputNames := tableNames
+	if !tableInfo.PKIsHandle && !tableInfo.IsCommonHandle {
+		tp := types.NewFieldType(mysql.TypeLonglong)
+		tp.SetFlag(mysql.NotNullFlag | mysql.PriKeyFlag)
+		extraCol := &expression.Column{
+			RetType:  tp,
+			UniqueID: b.ctx.GetSessionVars().AllocPlanColumnID(),
+			ID:       model.ExtraHandleID,
+			Index:    tableSchema.Len(),
+			OrigName: fmt.Sprintf("%v.%v.%v", dbName, tableInfo.Name, model.ExtraHandleName),
+		}
+		schemaCols := make([]*expression.Column, 0, tableSchema.Len()+1)
+		schemaCols = append(schemaCols, tableSchema.Columns...)
+		schemaCols = append(schemaCols, extraCol)
+		inputSchema = expression.NewSchema(schemaCols...)
+		inputNames = append(tableNames.Shallow(), &types.FieldName{
+			OrigTblName: tableInfo.Name,
+			OrigColName: model.ExtraHandleName,
+			DBName:      dbName,
+			TblName:     tableInfo.Name,
+			ColName:     model.ExtraHandleName,
+		})
+	}
+	mockPlan.SetSchema(inputSchema)
+	mockPlan.SetOutputNames(inputNames)
+
+	// The RETURNING list is a select list, so name resolution errors should read the same
+	// way as they do for one.
+	b.curClause = fieldList
+
+	// Expand `*` the same way a projection does, so that a qualifier is validated and
+	// hidden columns and _tidb_rowid are not returned by `RETURNING *`.
+	fields, err := b.unfoldWildStar(mockPlan, returning)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	nameByUniqueID := make(map[int64]*types.FieldName, len(inputNames))
+	for i, col := range inputSchema.Columns {
+		nameByUniqueID[col.UniqueID] = inputNames[i]
+	}
+
+	exprs := make([]expression.Expression, 0, len(fields))
+	cols := make([]*expression.Column, 0, len(fields))
+	names := make(types.NameSlice, 0, len(fields))
+	for _, field := range fields {
+		// A subquery is rejected rather than evaluated: an uncorrelated one would be run
+		// while the statement is planned and would therefore report the table as it was
+		// before the insert, and a correlated one cannot be evaluated over a written row
+		// at all. MariaDB rejects a subquery over the inserted table with ER_UPDATE_TABLE_USED.
+		if field.Expr.GetFlag()&ast.FlagHasSubquery != 0 {
+			return nil, nil, nil, false, plannererrors.ErrNotSupportedYet.GenWithStackByArgs("subquery in RETURNING clause")
+		}
+		expr, np, err := b.rewrite(ctx, field.Expr, mockPlan, nil, true)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		if np != mockPlan {
+			// The rewriter built a plan of its own; such an expression cannot be evaluated
+			// against a single written row.
+			return nil, nil, nil, false, plannererrors.ErrNotSupportedYet.GenWithStackByArgs("expression in RETURNING clause")
+		}
+		exprs = append(exprs, expr)
+		cols = append(cols, &expression.Column{
+			UniqueID: b.ctx.GetSessionVars().AllocPlanColumnID(),
+			RetType:  expr.GetType(b.ctx.GetExprCtx().GetEvalCtx()),
+		})
+
+		var colName *types.FieldName
+		switch col, isCol := expr.(*expression.Column); {
+		case field.AsName.L != "":
+			colName = &types.FieldName{ColName: field.AsName}
+		case isCol && nameByUniqueID[col.UniqueID] != nil:
+			origName := nameByUniqueID[col.UniqueID]
+			colName = &types.FieldName{
+				OrigTblName: origName.OrigTblName,
+				OrigColName: origName.OrigColName,
+				DBName:      origName.DBName,
+				TblName:     origName.TblName,
+				ColName:     origName.ColName,
+			}
+		case isCol:
+			colName = &types.FieldName{ColName: ast.NewCIStr(col.OrigName)}
+		default:
+			exprName, err := b.buildProjectionFieldNameFromExpressions(ctx, field)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			colName = &types.FieldName{ColName: exprName}
+		}
+		names = append(names, colName)
+	}
+
+	// The clause reads the row that was written, so it needs SELECT on the columns it
+	// reads, like a query over them would. Postgres states the same rule for RETURNING.
+	b.requireSelectPrivForReturning(exprs, nameByUniqueID, tableInfo.Name, dbName)
+
+	needExtraHandle := len(expression.ExtractColumnsFromExpressions(exprs, func(col *expression.Column) bool {
+		return col.ID == model.ExtraHandleID
+	})) > 0
+	return exprs, expression.NewSchema(cols...), names, needExtraHandle, nil
+}
+
+// requireSelectPrivForReturning requires SELECT privilege for the target-table columns that
+// the RETURNING expressions read. Without it an INSERT-only user could read a column it
+// cannot select: `INSERT ... ON DUPLICATE KEY UPDATE c = c RETURNING secret` returns the row
+// as it stands after the update, so `secret` would come from the row that was already there.
+// _tidb_rowid is not a column a privilege can be granted on, so it takes SELECT on the table.
+func (b *PlanBuilder) requireSelectPrivForReturning(
+	exprs []expression.Expression,
+	nameByUniqueID map[int64]*types.FieldName,
+	tableName, dbName ast.CIStr,
+) {
+	var authErr error
+	if user := b.ctx.GetSessionVars().User; user != nil {
+		authErr = plannererrors.ErrTableaccessDenied.FastGenByArgs("SELECT",
+			user.AuthUsername, user.AuthHostname, tableName.L)
+	}
+	for _, col := range expression.ExtractColumnsFromExpressions(exprs, nil) {
+		column := ""
+		if name := nameByUniqueID[col.UniqueID]; name != nil && col.ID != model.ExtraHandleID {
+			column = name.OrigColName.L
+		}
+		b.visitInfo = appendVisitInfo(b.visitInfo, mysql.SelectPriv, dbName.L, tableName.L, column, authErr)
+	}
 }
